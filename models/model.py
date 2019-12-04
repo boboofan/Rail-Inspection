@@ -1,69 +1,50 @@
 import tensorflow as tf
 
-from models.extract_feature import extract_points_feature, extract_images_feature
-from models.region_proposal_network import rpn_head, generate_anchors, generate_rpn_proposals, rpn_losses
+from models.region_proposal_network import RPN
+from models.fast_rcnn import Fast_RCNN
 from models.process_box import clip_boxes, offsets_to_boxes
-from models.fast_rcnn import sample_proposal_boxes, fastrcnn_losses, fastrcnn_predictions, crop_and_generate_images
+from models.utils import get_chebyshev_polynomials
 
 
-class Faster_RCNN:
-    def __init__(self, classes_num):
-        # backbone
-        self.classes_num = classes_num
-        self.scale_ratio = 1 / 32
+class Pointwise_RCNN(RPN, Fast_RCNN):
+    def __init__(self, max_degree=1, regularizer=5e-5):
+        super(Pointwise_RCNN, self).__init__(regularizer)
+
+        self.max_degree = max_degree
         self.loss_lambda = 1
-
-        # rpn
-        self.anchor_sizes = [16, 32, 64]
-        self.anchor_ratios = [0.1, 0.5, 1, 2, 5, 7]
-        self.anchors_num = len(self.anchor_sizes) * len(self.anchor_ratios) * 8
-
-        self.train_pre_nms_topk = 2000  # topk before nms
-        self.train_post_nms_topk = 1000  # topk after nms
-        self.test_pre_nms_topk = 1000
-        self.test_post_nms_topk = 500
-        self.min_edge_size = 0
-
-        self.positive_anchor_threshold = 0.7
-        self.negative_anchor_threshold = 0.3
-
-        self.proposal_nms_threshold = 0.7
-
-        # fast rcnn
-        self.boxes_num_per_image = 600
-        self.foreground_threshold = 0.5
-        self.foreground_ratio = 0.25
-        self.crop_size = [224, 224]
-
-        # test
-        self.score_threshold = 0.05
-        self.test_boxes_num_per_image = 100
-        self.test_nms_threshold = 0.5
         self.ap_threshold = 0.3
 
-    def rpn(self, points, gt_boxes, max_size, training):
+    def __get_polynomials(self, points):
+        # points: [points_num, 3]
+        polynomials = tf.numpy_function(get_chebyshev_polynomials, [points, self.max_degree], tf.float32)
+
+        points_shape = points.get_shape().as_list()
+        polynomials.set_shape([self.max_degree + 1, points_shape[0], points_shape[0]])
+
+        return polynomials
+
+    def rpn(self, points, polynomials, gt_boxes, max_size, training):
         '''
         :param points: [points_num, 3]
         :param gt_boxes: [gt_boxes_num, 4]  min_x, min_y, max_x, max_y
-        :param max_size: max_height, max_width
+        :param max_size: max_x, max_y
         '''
-        anchors = generate_anchors(points, self.anchor_sizes, self.anchor_ratios)  # [points_num*anchors_num, 4]
+        anchors = self.generate_anchors(points)  # [points_num * anchors_num, 4]
+        norm_points = self.normalization(points, batch=False)
 
-        points_feature = extract_points_feature(points, training)
-        pred_offsets, pred_scores = rpn_head(points_feature, self.anchors_num)  # [n, 4], [n]
-        pred_boxes = offsets_to_boxes(pred_offsets, anchors)  # [n, 4]
+        pred_offsets, pred_scores = self.rpn_head(norm_points, polynomials, self.anchors_num)
+        pred_boxes = offsets_to_boxes(pred_offsets, anchors)
 
-        self.proposal_boxes, self.proposal_scores = generate_rpn_proposals(
-            pred_boxes, pred_scores,
-            self.train_pre_nms_topk if training else self.test_pre_nms_topk,
-            self.train_post_nms_topk if training else self.test_post_nms_topk,
-            self.proposal_nms_threshold, max_size, self.min_edge_size)
+        proposal_boxes, proposal_scores = self.generate_rpn_proposals(pred_boxes, pred_scores, max_size, training)
 
         if training:
-            self.rpn_losses = rpn_losses(anchors, gt_boxes, pred_offsets, pred_scores,
-                                         self.positive_anchor_threshold, self.negative_anchor_threshold)
+            reg_loss, cls_loss = self.rpn_losses(anchors, gt_boxes, pred_offsets, pred_scores)
+        else:
+            reg_loss, cls_loss = None, None
 
-    def roi_heads(self, points, proposal_boxes, gt_boxes, gt_labels, max_size, training):
+        return [proposal_boxes, proposal_scores], [reg_loss, cls_loss]
+
+    def roi_heads(self, points, proposal_boxes, gt_boxes, gt_labels, max_size, classes_num, training):
         '''
         :param points: [points_num, 3]
         :param proposal_boxes: [N, 4]
@@ -75,60 +56,41 @@ class Faster_RCNN:
         '''
 
         if training:
-            proposal_boxes, proposal_labels, foreground_gt_index = sample_proposal_boxes(proposal_boxes,
-                                                                                         gt_boxes, gt_labels,
-                                                                                         self.boxes_num_per_image,
-                                                                                         self.foreground_threshold,
-                                                                                         self.foreground_ratio)
+            proposal_boxes, proposal_labels, foreground_gt_index = self.sample_proposal_boxes(proposal_boxes,
+                                                                                              gt_boxes, gt_labels)
         else:
             proposal_boxes, proposal_labels, foreground_gt_index = proposal_boxes, None, None
 
-        cropped_image = crop_and_generate_images(points, proposal_boxes, self.crop_size)
+        cropped_points = self.crop_and_sample(points, proposal_boxes)
+        polynomials = tf.map_fn(self.__get_polynomials, cropped_points, tf.float32)
+        cropped_points = self.normalization(cropped_points, batch=True)
 
-        image_feature = extract_images_feature(cropped_image, training)  # [N, h, w, 512]
-        gap = tf.reduce_mean(image_feature, axis=[1, 2])  # [N, 512] Global average pooling
-
-        # [N, classes_num+1, 4]
-        offset_logits = tf.layers.dense(gap, (self.classes_num + 1) * 4,
-                                        kernel_initializer=tf.truncated_normal_initializer(stddev=0.01))
-        offset_logits = tf.reshape(offset_logits, [-1, self.classes_num + 1, 4])
-
-        # [N, classes_num+1]
-        label_logits = tf.layers.dense(gap, self.classes_num + 1,
-                                       kernel_initializer=tf.truncated_normal_initializer(stddev=0.01))
+        # [N, classes_num+1, 4], [N, classes_num+1]
+        pred_offsets, pred_labels = self.extract_feature(cropped_points, polynomials, classes_num)
 
         if training:
-            self.fastrcnn_losses, self.fastrcnn_accuracies = fastrcnn_losses(proposal_boxes, proposal_labels,
-                                                                             foreground_gt_index,
-                                                                             offset_logits, label_logits, gt_boxes)
+            reg_loss, cls_loss, train_accuracy = self.fastrcnn_losses(proposal_boxes, proposal_labels,
+                                                                      foreground_gt_index,
+                                                                      pred_offsets, pred_labels, gt_boxes)
+            return [reg_loss, cls_loss, train_accuracy]
         else:
-            proposal_anchors = tf.tile(tf.expand_dims(proposal_boxes, axis=1), [1, self.classes_num + 1, 1])
-            box_logits = offsets_to_boxes(offset_logits, proposal_anchors)
-            box_logits = clip_boxes(box_logits, max_size)  # [N, classes_num+1, 4]
+            proposal_anchors = tf.tile(tf.expand_dims(proposal_boxes, axis=1), [1, classes_num + 1, 1])
+            pred_boxes = offsets_to_boxes(pred_offsets, proposal_anchors)
+            pred_boxes = clip_boxes(pred_boxes, max_size)  # [N, classes_num+1, 4]
 
-            label_scores = tf.nn.softmax(label_logits, axis=-1)  # [N, classes_num+1]
+            pred_scores = tf.nn.softmax(pred_labels, axis=-1)  # [N, classes_num+1]
 
-            self.final_boxes, self.final_labels, self.final_scores = fastrcnn_predictions(box_logits, label_scores,
-                                                                                          self.score_threshold,
-                                                                                          self.test_boxes_num_per_image,
-                                                                                          self.test_nms_threshold)
+            final_boxes, final_labels, final_scores = self.fastrcnn_predictions(pred_boxes, pred_scores)
 
-    def get_loss(self, points, gt_boxes, gt_labels, max_size):
-        self.rpn(points, gt_boxes, max_size, True)
-        self.roi_heads(points, self.proposal_boxes, gt_boxes, gt_labels, max_size, True)
+            return [final_boxes, final_labels, final_scores]
 
-        loss = self.rpn_losses + self.fastrcnn_losses
-        loss = loss[0] * self.loss_lambda + loss[1]
-        return tf.reduce_mean(loss)
+    def build_network(self, points, polynomials, gt_boxes, gt_labels, max_size, classes_num, training):
+        proposals, rpn_loss = self.rpn(points, polynomials, gt_boxes, max_size, training)
+        outputs = self.roi_heads(points, proposals[0], gt_boxes, gt_labels, max_size, classes_num, training)
+        if training:
+            loss = rpn_loss[0] + outputs[0] + self.loss_lambda * (rpn_loss[1] + outputs[1])
+            train_accuracy = outputs[2]
 
-    def get_outputs(self, points, gt_boxes, gt_labels, max_size):
-        self.rpn(points, gt_boxes, max_size, False)
-        self.roi_heads(points, self.proposal_boxes, gt_boxes, gt_labels, max_size, False)
-
-        return self.final_boxes, self.final_labels, self.final_scores + self.proposal_scores
-
-    def get_train_accuracy(self, points, gt_boxes, gt_labels, max_size):
-        self.rpn(points, gt_boxes, max_size, True)
-        self.roi_heads(points, self.proposal_boxes, gt_boxes, gt_labels, max_size, True)
-
-        return self.fastrcnn_accuracies
+            return [loss, train_accuracy]
+        else:
+            return outputs

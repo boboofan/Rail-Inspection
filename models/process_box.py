@@ -84,13 +84,13 @@ def pairwise_intersection_area(boxes1, boxes2):
     min_x1, min_y1, max_x1, max_y1 = tf.split(boxes1, 4, axis=-1)  # [N, 1]
     min_x2, min_y2, max_x2, max_y2 = tf.split(boxes2, 4, axis=-1)  # [M, 1]
 
-    minimun_max_y = tf.minimum(max_y1, tf.transpose(max_y2, [1, 0]))
+    minimum_max_y = tf.minimum(max_y1, tf.transpose(max_y2, [1, 0]))
     maximum_min_y = tf.maximum(min_y1, tf.transpose(min_y2, [1, 0]))
-    intersecting_h = tf.maximum(0.0, minimun_max_y - maximum_min_y)  # [N, M]
+    intersecting_h = tf.maximum(0.0, minimum_max_y - maximum_min_y)  # [N, M]
 
-    minimun_max_x = tf.minimum(max_x1, tf.transpose(max_x2, [1, 0]))
+    minimum_max_x = tf.minimum(max_x1, tf.transpose(max_x2, [1, 0]))
     maximum_min_x = tf.maximum(min_x1, tf.transpose(min_x2, [1, 0]))
-    intersecting_w = tf.maximum(0.0, minimun_max_x - maximum_min_x)  # [N, M]
+    intersecting_w = tf.maximum(0.0, minimum_max_x - maximum_min_x)  # [N, M]
 
     return tf.multiply(intersecting_h, intersecting_w)  # [N, M]
 
@@ -108,4 +108,4 @@ def pairwise_iou(boxes1, boxes2):
 
     unions = tf.expand_dims(areas1, 1) + tf.expand_dims(areas2, 0) - intersections
 
-    return tf.truediv(intersections, unions)
+    return tf.where(tf.equal(intersections, 0.0), tf.zeros_like(intersections), tf.truediv(intersections, unions))

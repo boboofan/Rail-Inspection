@@ -1,62 +1,65 @@
-import tensorflow as tf
 import os
-from easydict import EasyDict
+import tensorflow as tf
+from tqdm import tqdm
 
-from models.model import Faster_RCNN
-from preprocessing.dataset import read_dataset
+from models.model import Pointwise_RCNN
+from preprocessing.preprocess_data import divide_data, read_data
 from models.metric import average_precision
-from preprocessing.draw_figure_new import draw_picture
 
 
-def get_config():
-    cfg = EasyDict()
+class Trainer:
+    def __init__(self):
+        self.classes_num = 2
+        self.points_num = 1000
+        self.max_degree = 1
+        self.train_size = 0.8
+        self.raw_data_path = 'D:/360data/重要数据/桌面/Pointwise-FasterRCNN/new_data'
+        self.divided_data_path = 'D:/360data/重要数据/桌面/Pointwise-FasterRCNN/divided_data'
+        if not os.path.exists(self.divided_data_path):
+            divide_data(self.raw_data_path, self.divided_data_path, self.points_num, self.max_degree, self.train_size)
 
-    cfg.classes_num = 2
-    cfg.epochs = 10
-    cfg.learning_rate = 0.001
-    cfg.log_path = './logs'
-    cfg.model_saving_path = './model_saving'
-    cfg.model_name = 'Pointwise-FasterRCNN'
+        self.epochs = 20
+        self.learning_rate = 0.001
+        self.optimizer = tf.train.GradientDescentOptimizer(self.learning_rate)
 
-    return cfg
+        self.model = Pointwise_RCNN()
+        # self.saver = tf.train.Saver()
 
+        self.points = tf.placeholder(tf.float32, [self.points_num, 3])
+        self.polynomials = tf.placeholder(tf.float32, [self.max_degree + 1, self.points_num, self.points_num])
+        self.gt_boxes = tf.placeholder(tf.float32, [None, 4])
+        self.gt_labels = tf.placeholder(tf.int32, [None])
+        self.max_size = tf.placeholder(tf.float32, [2])  # max_x, max_y
 
-def train(cfg, saving):
-    points = tf.placeholder(tf.float32, [None, 3])
-    gt_boxes = tf.placeholder(tf.float32, [None, 4])
-    gt_labels = tf.placeholder(tf.int32, [None])
-    max_size = tf.placeholder(tf.float32, [2])
+        self.train_data, self.test_data = read_data(self.divided_data_path)
 
-    model = Faster_RCNN(cfg.classes_num)
-    loss = model.get_loss(points, gt_boxes, gt_labels, max_size)
-    pred_boxes, pred_labels, pred_scores = model.get_outputs(points, gt_boxes, gt_labels, max_size)
+    def train(self):
+        print('start training..')
 
-    global_steps = tf.Variable(0, trainable=False)
+        global_step = tf.Variable(0, trainable=False, name='global_step')
+        loss, train_accuracy = self.model.build_network(self.points, self.polynomials, self.gt_boxes, self.gt_labels,
+                                                        self.max_size, self.classes_num, training=True)
+        train_step = self.optimizer.minimize(loss, global_step=global_step)
 
-    train_step = tf.train.AdamOptimizer(cfg.learning_rate).minimize(loss, global_step=global_steps)
+        with tf.Session() as sess:
+            sess.run(tf.global_variables_initializer())
+            sess.run(tf.local_variables_initializer())
 
-    saver = tf.train.Saver()
+            for epoch in range(self.epochs):
+                for i in tqdm(range(len(self.train_data))):
+                    ps, gt, poly = self.train_data[i]
+                    max_x, max_y = ps[:, 0].max(), ps[:, 1].max()
+                    feed_dict = {self.points: ps, self.polynomials: poly, self.gt_boxes: gt[:, :4],
+                                 self.gt_labels: gt[:, 4], self.max_size: (max_x, max_y)}
 
-    with tf.Session() as sess:
-        sess.run(tf.global_variables_initializer())
-        sess.run(tf.local_variables_initializer())
+                    _, loss_val, train_acc_val = sess.run([train_step, loss, train_accuracy], feed_dict=feed_dict)
 
-        for epoch in range(cfg.epochs):
-            iter = read_dataset()
-            for input_points, input_gt_boxes, input_gt_labels, input_orgin_point, input_max_size in iter:
-                if input_points.shape[0] == 0 or input_gt_boxes.shape[0] == 0:
-                    continue
-
-                feed_dict = {points: input_points, gt_boxes: input_gt_boxes,
-                             gt_labels: input_gt_labels, max_size: input_max_size}
-                _, loss_val, steps = sess.run([train_step, loss, global_steps], feed_dict=feed_dict)
-                print('epoch %d: loss is %.2f' % (epoch + 1, loss_val))
-                if saving and steps % 100 == 0:
-                    saver.save(sess, os.path.join(cfg.model_saving_path, cfg.model_name), global_step=steps)
+                    print('epoch %d, loss is %.2f, train acc is %.2f' % (epoch, loss_val, train_acc_val))
 
 
 def main():
-    train(get_config(), False)
+    model = Trainer()
+    model.train()
 
 
 if __name__ == '__main__':
