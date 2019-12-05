@@ -6,4 +6,7 @@ Inspired by [Tensorpack/examples/FasterRCNN](https://github.com/tensorpack/tenso
 Reference: [Faster R-CNN: Towards Real-Time Object Detection with Region Proposal Networks](https://arxiv.org/abs/1506.01497)
 
 Results:
-![Result1](https://github.com/boboofan/Rail-Inspection/blob/master/myplot1.png)
+![result1](https://github.com/boboofan/Rail-Inspection/blob/master/myplot1.png)
+![result2](https://github.com/boboofan/Rail-Inspection/blob/master/myplot2.png)
+![result3](https://github.com/boboofan/Rail-Inspection/blob/master/myplot3.png)
+![result4](https://github.com/boboofan/Rail-Inspection/blob/master/myplot4.png)
