@@ -1,0 +1,123 @@
+import os
+import uuid
+import random
+import shutil
+
+import numpy as np
+import pandas as pd
+
+VALID_SPLIT = 0.2
+CLASSES = [1, 2, 3, 4, 10, 11, 12, 13]
+SCALE = 10
+
+
+data_root = os.path.join('data', 'images4cls')
+shutil.rmtree('data/images4cls/', ignore_errors=True)
+
+os.makedirs(os.path.join(data_root, 'train'))
+os.makedirs(os.path.join(data_root, 'valid'))
+for cls in CLASSES:
+    os.makedirs(os.path.join(data_root, str(cls)))
+    
+data_files = os.listdir('data/')
+data_files = filter(lambda file: file.endswith('.txt'), data_files)
+
+array_files = []
+label_files = []
+
+for file in data_files:
+    if 'arr' in file:
+        array_files.append(file)
+    else:
+        label_files.append(file)
+        
+array_files.sort()
+label_files.sort()
+
+
+for afile, lfile in zip(array_files, label_files):
+    print(f'[INFO] processing {afile}')
+    array = pd.read_csv(os.path.join('data', afile), header=None)
+    label = pd.read_csv(os.path.join('data', lfile), header=None)
+    array = array.iloc[:, [0, 1, 2]].sort_values(1)
+    label = label.iloc[:, [0, 1, 2, 3, 4]].drop_duplicates()
+    
+    array, label = array.values, label.values
+    
+    array[:, 0] += 1
+    array[:, 1] = np.round(array[:, 1] * SCALE)
+    array[:, 2] = np.round(array[:, 2] * SCALE)
+    
+    label = label[label[:, 1] < 430]
+    label[:, :4] = label[:, :4] * SCALE
+    
+    array, label = array.astype(np.int32), label.astype(np.int32)
+    
+    larray, rarray = array[array[:, 0] <= 9], array[array[:, 0] > 9]
+    llabel, rlabel = label[label[:, 1] <= 230 * SCALE], label[label[:, 1] >= 230 * SCALE]
+    
+    rarray[:, 0] -= 9
+    rarray[:, 2] -= 230 * SCALE
+    rlabel[:, 1] -= 230 * SCALE
+    rlabel[:, 3] -= 230 * SCALE
+    
+#     array[:, 2] = np.where(tmp[:, 0] <= 9, tmp[:, 2], tmp[:, 2] - 230)
+#     label[:, 1] = np.where((label[:, 1] < 230) & (label[:, 3] < 230), label[:,1], label[:, 1]-230)
+#     label[:, 3] = np.where((label[:, 1] < 230) & (label[:, 3] < 230), label[:,3], label[:, 3]-230)
+
+    for array, label in zip([larray, rarray], [llabel, rlabel]):
+    
+        for lb in label:
+
+            if lb[-1] < 0:
+                print(lfile)
+                print(lb)
+
+            idx = ((array[:, 1] >= lb[0]) 
+                & (array[:, 1]<= lb[2]) 
+                & (array[:, 2] >= lb[1]) 
+                &  (array[:, 2] <= lb[3]))
+            if not np.any(idx):
+                continue
+
+            points = array[idx]
+
+            x_min, x_max = np.min(points[:, 1]), np.max(points[:, 1])
+            y_min, y_max = np.min(points[:, 2]), np.max(points[:, 2])
+
+            shape = (y_max-y_min+1, x_max-x_min+1)
+            res = np.zeros(shape)
+            for pt in points:
+                res[pt[2]-y_min, pt[1]-x_min] = pt[0]
+
+
+#             if not os.path.exists(os.path.join(data_root, str(lb[-1]))):
+#                 os.mkdir(os.path.join(data_root, str(lb[-1])))
+
+            np.save(os.path.join(data_root, str(lb[-1]), uuid.uuid4().hex), res)
+    
+    
+# split the dataset into train set and valid set
+print('[INFO] splitting train and valid sets')
+for cls in CLASSES:
+    
+    cls_path = os.path.join(data_root, str(cls))
+    
+    samples = os.listdir(cls_path)
+    samples = [os.path.join(cls_path, sample) for sample in samples]
+    
+    nb_valid = int(VALID_SPLIT * len(samples))
+    nb_train = len(samples) - nb_valid
+    random.shuffle(samples)
+    
+    target_dir = os.path.join(data_root, 'train', str(cls)) 
+    os.makedirs(target_dir)
+    for sample in samples[:nb_train]:
+        shutil.move(sample, target_dir)
+        
+    target_dir = os.path.join(data_root, 'valid', str(cls))
+    os.makedirs(target_dir)
+    for sample in samples[nb_train:]:
+        shutil.move(sample, target_dir)
+        
+    os.rmdir(cls_path)

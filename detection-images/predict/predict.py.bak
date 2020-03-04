@@ -1,0 +1,265 @@
+import os
+import gc
+import shutil
+
+from io import StringIO
+from socketserver import StreamRequestHandler, ThreadingTCPServer
+
+import numpy as np
+import pandas as pd
+import torch
+
+from tqdm import tqdm
+from torch.utils.data import Dataset, DataLoader
+from torchvision.ops import nms
+
+from model import TrackDetectionModel
+
+SCALE = 10
+
+xwindow = 5000
+xstride = 2000
+
+
+class Track(Dataset):
+    
+    def __init__(self, filepath_or_buffer, args):
+        
+        self.args = args
+                
+        array = pd.read_csv(filepath_or_buffer, header=None)
+
+        array = array.iloc[:, [0, 1, 2]].sort_values(1).values
+
+        array[:, 0] += 1
+        array[:, 1] = np.round(array[:, 1] * SCALE)
+        array[:, 2] = np.round(array[:, 2] * SCALE)
+
+        array = array.astype(float)
+
+        self.larray = array[array[:, 0] <= 9]
+        self.lx0 = np.min(self.larray[:, 1])
+        self.llen = int(np.ceil((np.max(self.larray[:, 1]) - np.min(self.larray[:, 1])) / xstride))
+        
+        self.rarray = array[array[:, 0] > 9]
+        self.rarray[:, 0] -= 9
+        self.rarray[:, 2] -= 230 * SCALE
+        self.rx0 = np.min(self.rarray[:, 1])
+        self.rlen = int(np.ceil((np.max(self.rarray[:, 1]) - np.min(self.rarray[:, 1])) / xstride))
+        
+        
+    def __getitem__(self, index):
+        
+        if index < self.llen:
+            array, x, y = self.larray, self.lx0 + index * xstride, 0
+        else:
+            array, x, y = self.rarray, self.rx0 + (index - self.llen) * xstride, 230*SCALE
+        
+        # optimizing ???
+        points = array[(array[:, 1] >= x) & (array[:, 1] < x+xwindow)]
+        
+        if len(points) == 0:
+            return None, {'x': None, 'y': None}
+        
+        allelems = np.unique(points[:, 0])
+        if len(allelems) == 1 and allelems == 9:
+            return None, {'x': None, 'y': None}
+
+        img = torch.zeros((1, 200*SCALE, xwindow), dtype=torch.half)
+        for pt in points:
+            img[0, int(pt[2]), int(pt[1]-x)] = pt[0]
+
+        return img, {'x': torch.tensor(x), 'y': torch.tensor(y)}
+        
+        
+    def __len__(self):
+        return self.llen + self.rlen
+    
+    def collate_fn(self, batch):
+        return tuple(zip(*batch))
+    
+    def name2label(self, name):
+        mapping = {
+             1: 1,
+             2: 2,
+             3: 3,
+             4: 4,
+            10: 5,
+            11: 6,
+            12: 7,
+            13: 8
+        }
+        return mapping[name]
+    
+    
+    def label2name(self, label):
+        mapping = {
+            1:  1,
+            2:  2,
+            3:  3,
+            4:  4,
+            5: 10,
+            6: 11,
+            7: 12,
+            8: 13
+        }
+        return mapping[label]
+    
+    def process(self, model):
+
+        device = torch.device('cuda:0' if torch.cuda.is_available() else 'cpu')
+        model.to(device)
+
+        data= DataLoader(self,
+            batch_size=self.args.batch_size,
+            num_workers=self.args.num_workers,
+    #         pin_memory=True,
+            collate_fn=self.collate_fn
+        )
+
+        boxes = []
+        scores = []
+        labels = []
+
+        for inputs, info in tqdm(data):
+
+            inputs = [inp for inp in inputs if inp is not None]
+            info = [inf for inf in info if inf['x'] is not None]
+            if len(inputs) == 0:
+                continue
+
+            inputs = [inp.to(device) for inp in inputs]
+
+            with torch.no_grad():
+                outputs = model(inputs)
+
+            for inf, outp in zip(info, outputs):
+                x = inf['x']
+                y = inf['y']
+                bs = outp['boxes'].to(torch.float)
+                bs[:, 0] += x
+                bs[:, 2] += x
+                bs[:, 1] += y
+                bs[:, 3] += y
+                bs /= SCALE
+                boxes.extend(bs)
+                labels.extend(outp['labels'].to(torch.int))
+                scores.extend(outp['scores'].to(torch.float))
+
+        boxes = torch.stack(boxes)
+        scores = torch.stack(scores)
+        labels = torch.stack(labels)
+
+        ids = nms(boxes, scores, iou_threshold=self.args.box_score_thresh).cpu().numpy()    
+        return {
+            'boxes': boxes[ids].cpu().numpy(),
+            'labels': labels[ids].cpu().numpy(),
+            'scores': scores[ids].cpu().numpy()
+        }
+
+    
+    
+    def postprocess(self, pred):
+        
+        pred['labels'] = [self.label2name(int(label)) for label in pred['labels']]
+        
+        n = len(pred['boxes'])
+        res = np.zeros((n, 6))
+        res[:, :4] = pred['boxes']
+        res[:, 4] = pred['labels']
+        res[:, 5] = pred['scores']
+        res = pd.DataFrame(res)
+        res.sort_values(0, axis=0, inplace=True)
+
+        return res
+
+
+
+
+def main(args):
+
+        
+    model = TrackDetectionModel( 
+        box_score_thresh=args.box_score_thresh, 
+        box_nms_thresh=args.box_nms_thresh
+    )
+    model.load_state_dict(torch.load('checkpoint.pth')['model'])
+    model.half().eval()
+
+    
+    if args.online:
+        
+        class PredHandler(StreamRequestHandler):
+    
+            def handle(self):
+                print('[INFO] Conneted from {}.'.format(self.client_address))
+                
+                blen = int(str(self.rfile.readline(), 'utf-8'))
+                buffer = self.rfile.read(blen)
+                text = str(buffer, encoding='utf-8')
+                
+                data = Track(StringIO(text), args)
+                pred = data.process(model)
+                res = data.postprocess(pred)
+
+                res = bytes(res.to_csv(index=False, header=False), encoding='utf-8')
+                alen = bytes(str(len(res)) + '\n', encoding='utf-8')
+                self.wfile.write(alen + res)
+#                 print('[INFO] Disconneted from {}.'.format(self.client_address))
+                
+        print('[INFO] Listening to 127.0.0.1:{}'.format(args.port))
+        server = ThreadingTCPServer(
+            ('127.0.0.1', args.port),
+            PredHandler
+        )
+        server.serve_forever()
+        
+    else:
+
+        array_files = os.listdir(args.input_dir)
+        array_files = [
+            file
+            for file in array_files 
+            if file.endswith('_arr.txt')
+        ]
+        
+        for afile in array_files:
+
+            print(f'[INFO] processing {afile}')
+
+            data = Track(os.path.join('in', afile), args)
+            pred = data.process(model)
+            res = data.postprocess(pred)
+
+            del data
+            gc.collect()
+
+            lfile = afile.split('_')[0] + '_label.txt'
+            res.to_csv(
+                os.path.join(args.output_dir, lfile),
+                index=False, header=False
+            )
+        
+    
+
+if __name__ == "__main__":
+    import argparse
+    parser = argparse.ArgumentParser(description='Predicting')
+    
+    parser.add_argument('-i', '--input-dir', default='in', help='path to input data')
+    parser.add_argument('-o', '--output-dir', default='out', help='path where to save')
+
+    parser.add_argument('-b', '--batch-size', default=8, type=int)
+    parser.add_argument('-n', '--num-workers', default=8, type=int, help='number of workers to load data')
+    
+    parser.add_argument('--box-score-thresh', default=0.05, type=float)
+    parser.add_argument('--box-nms-thresh', default=0.5, type=float)
+    
+    parser.add_argument('--online', action="store_true", help='online predicting')
+    parser.add_argument('--port', default=28889, type=int, help='TCP port where socket is open')
+
+    args = parser.parse_args()
+
+    os.makedirs(os.path.join(args.output_dir), exist_ok=True)
+
+    main(args)
