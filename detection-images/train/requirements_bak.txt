@@ -2,7 +2,7 @@ pycocotools==2.0.0
 numpy==1.16.3
 opencv_python==4.0.0.21
 pandas==0.24.1
-Pillow==6.1.0
+Pillow==6.2.0
 atlas==0.27.0
 
 https://download.pytorch.org/whl/cu100/torch-1.1.0-cp36-cp36m-linux_x86_64.whl
